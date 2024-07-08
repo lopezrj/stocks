@@ -1,0 +1,150 @@
+---
+title: "Stocks with DuckDB"
+format: html
+---
+
+## Load libraries and data
+
+Load libraries `duckdb`, `tidyverse`, `dbplyr` and `stringr`.
+
+```{r}
+#| echo: false
+#| warning: false
+library(duckdb)
+library(tidyverse)
+library(stringr)
+library(dbplyr)
+library(knitr)
+```
+
+In this example, we’ll read in some stock price data from CSVs that live in GitHub.
+
+```{r}
+#| echo: true
+
+# list of URLs containing our csv files
+base_url <- "https://raw.githubusercontent.com/Robot-Wealth/r-quant-recipes/master/data/"
+stocks <- c("AAPL", "BA", "CAT", "IBM", "MSFT")
+urls <- str_glue("{base_url}{stocks}.csv")
+```
+
+Read data into a dataframe and display.
+
+```{r}
+# read data into a dataframe
+prices_df <- urls %>%
+  map_dfr(read_csv, col_types = "Dddddddc") %>%
+  arrange(Date, Ticker)
+
+head(prices_df) |>
+  kable()
+```
+
+
+```{r}
+# to make a persistent db on disk (and to connect to it again later) do:
+con <- dbConnect(duckdb::duckdb(dbdir = "mydatabase.duckdb"))
+
+# write our prices data to duckdb table
+table_name <- "prices"
+duckdb::dbWriteTable(con, table_name, prices_df, overwrite = TRUE)
+
+# remove prices_df
+rm(prices_df)
+
+dbDisconnect(con)
+
+```
+
+### 3. Query some data in our db
+```{r}
+con <- dbConnect(duckdb::duckdb(dbdir = "mydatabase.duckdb"))
+tbl(con, "prices") %>%
+  group_by(Ticker) %>%
+  summarise(
+    Count = n(),
+    From = first(Date),
+    To = last(Date)
+  ) |>
+  kable()
+```
+
+You can also send SQL to be executed on the database. If you want to get the result back in your R session, use dbGetQuery, otherwise use dbSendQuery:
+```{r}
+result <- dbGetQuery(con, paste0("SELECT * FROM prices LIMIT 5"))
+result |>
+  kable()
+```
+You can do the operation above by writing an equivalent dplyr operation and piping it into collect:
+
+```{r}
+tbl(con, "prices") %>%
+  head(5) |>
+  collect() |>
+  kable()
+dbDisconnect(con)
+```
+```{r}
+# Basic TWAP approximation
+
+con <- dbConnect(duckdb::duckdb(dbdir = "mydatabase.duckdb"))
+
+# will work
+tbl(con, "prices") |>
+   dplyr::mutate(TWAP = (Open + High + Low + Close)/4) |>
+   head() |>
+  kable()
+
+dbDisconnect(con)
+```
+
+```{r}
+con <- dbConnect(duckdb::duckdb(dbdir = "mydatabase.duckdb"))
+# 60-day moving average
+affected_rows <- dbExecute(con,
+    'ALTER TABLE prices ADD COLUMN IF NOT EXISTS MA60 DOUBLE;
+     UPDATE prices SET MA60 = t2.MA60
+     FROM (
+        SELECT Ticker, Date, AVG("Adj Close") OVER (
+            PARTITION BY Ticker ORDER BY Date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+        ) AS MA60
+    FROM prices
+    ) t2
+WHERE prices.Ticker = t2.Ticker AND prices.Date = t2.Date;'
+)
+
+# prices <- tbl(con, "prices")
+
+# prices |>
+# group_by(Ticker) |>
+# window_order(Date) |>
+# window_frame(-59, 0) |>
+# mutate(MA60 = mean(`Adj Close`)) |>
+# ungroup()
+
+affected_rows
+
+tbl(con, "prices") |> head() |> kable()
+
+dbDisconnect(con)
+```
+```{r}
+con <- dbConnect(duckdb::duckdb(dbdir = "mydatabase.duckdb"))
+
+# Set chart options
+options(repr.plot.width = 14, repr.plot.height=7)
+theme_set(theme_bw())
+theme_update(text = element_text(size = 12))
+
+# plot
+tbl(con, "prices") %>%
+  select(Date, Ticker, `Adj Close`, MA60) %>%
+  pivot_longer(cols = c(`Adj Close`, MA60), names_to = "Type", values_to = "Price") %>%
+  ggplot(aes(x = Date, y = Price, colour = Type)) +
+    geom_line() +
+    facet_wrap(~Ticker) +
+    labs(title = "Closing prices and their 60-day moving average")
+
+dbDisconnect(con)
+```
+
